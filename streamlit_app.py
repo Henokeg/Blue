@@ -29,16 +29,58 @@ def generate_signal(df, short_ema_period=50, long_ema_period=200,
                     rsi_period=14, rsi_buy_thresh=40, rsi_sell_thresh=70,
                     atr_mult_for_stop=1.5):
     close = df['Close']
-    se = ema(close, short_ema_period)
-    le = ema(close, long_ema_period)
-    rsi = compute_rsi(close, rsi_period)
-    atr_series = atr(df, 14)
+    needed = max(short_ema_period, long_ema_period, rsi_period) + 5
+    if len(close) < needed:
+        raise ValueError(f"not_enough_bars: have={len(close)} need>={needed}")
 
-    last_close = float(close.iloc[-1])
-    last_se = float(se.iloc[-1])
-    last_le = float(le.iloc[-1])
+    se = close.ewm(span=short_ema_period, adjust=False).mean()
+    le = close.ewm(span=long_ema_period, adjust=False).mean()
+
+    # RSI
+    d = close.diff()
+    up = d.clip(lower=0); dn = -d.clip(upper=0)
+    rsi = 100 - (100/(1 + up.rolling(rsi_period).mean() / dn.rolling(rsi_period).mean()))
+
+    # ATR
+    hl = df['High'] - df['Low']
+    hc = (df['High'] - df['Close'].shift()).abs()
+    lc = (df['Low'] - df['Close'].shift()).abs()
+    atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
+
+    ema_state = "neutral"
+    if se.iloc[-1] > le.iloc[-1] and se.iloc[-2] <= le.iloc[-2]:
+        ema_state = "bullish_crossover"
+    elif se.iloc[-1] < le.iloc[-1] and se.iloc[-2] >= le.iloc[-2]:
+        ema_state = "bearish_crossover"
+
+    price = float(close.iloc[-1])
     last_rsi = float(rsi.iloc[-1])
-    last_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else np.nan
+    last_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else np.nan
+
+    if ema_state == "bullish_crossover" and last_rsi <= rsi_buy_thresh:
+        signal = "BUY"
+    elif ema_state == "bearish_crossover" and last_rsi >= rsi_sell_thresh:
+        signal = "SELL"
+    else:
+        signal = "BUY (RSI oversold)" if last_rsi < 30 else ("SELL (RSI overbought)" if last_rsi > 75 else "HOLD")
+
+    if np.isnan(last_atr):
+        stop = tp1 = tp2 = np.nan
+    else:
+        if signal.startswith("BUY"):
+            stop = price - 1.5*last_atr
+            tp1  = price + 3*last_atr
+            tp2  = price + 6*last_atr
+        elif signal.startswith("SELL"):
+            stop = price + 1.5*last_atr
+            tp1  = price - 2.25*last_atr
+            tp2  = price - 4.5*last_atr
+        else:
+            stop = tp1 = tp2 = np.nan
+
+    return {"signal": signal, "price": price, "short_ema": float(se.iloc[-1]),
+            "long_ema": float(le.iloc[-1]), "rsi": last_rsi, "atr": last_atr,
+            "stop": stop, "tp1": tp1, "tp2": tp2, "ema_state": ema_state}
 
     # crossover detection
     ema_state = "neutral"
