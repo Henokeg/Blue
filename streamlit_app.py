@@ -208,4 +208,4 @@ if run:
             ])
 
 st.markdown("---")
-st.caption("Signals are educational only — not fina
+st.caption(st.caption("Signals are educational only — not financial advice.")
