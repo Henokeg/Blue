@@ -1,4 +1,5 @@
-import numpy as np
+
+            return "1y"import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
@@ -20,7 +21,6 @@ def _period_for(interval: str, lookback_days: int) -> str:
         if lookback_days <= 186:
             return "6mo"
         if lookback_days <= 365:
-            return "1y"
         if lookback_days <= 730:
             return "2y"
         return "5y"
