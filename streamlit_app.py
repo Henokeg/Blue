@@ -63,20 +63,26 @@ def fetch_stock_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFra
     req_period = _period_for(interval, lookback_days)
 st.caption(f"{t}: requesting interval {interval} with period {req_period}")
 df = fetch_stock_df(t, interval, lookback_days)
-if df is None:
-    st.warning(f"{t}: No data returned for this ticker")
-    return None
-st.caption(f"{t}: got {len(df)} bars")
+# 64
+st.caption(f"{t}: requesting interval {interval}")
 
+# 65
+df = fetch_stock_df(t, interval, lookback_days)
+
+# 66–79 REPLACE WITH THIS:
 if df is None or df.empty:
-    return None   # <-- this line indented by exactly 4 spaces
+    st.warning(f"{t}: No data returned for this ticker")
+else:
+    st.caption(f"{t}: got {len(df)} bars")
+
     need = {"Open", "High", "Low", "Close"}
     if not need.issubset(df.columns):
-        return None
-
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    return df if not df.empty else None
-
+        st.warning(f"{t}: missing OHLC columns — skipping")
+    else:
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        # ↓↓↓ keep the rest of your per-ticker processing below this line
+        # e.g., s = generate_signal(df, ...)
+        #      ... show table / chart / results ...
 def generate_signal(df, short_ema_period=50, long_ema_period=200,
                     rsi_period=14, rsi_buy_thresh=40, rsi_sell_thresh=70,
                     atr_mult_for_stop=1.5):
