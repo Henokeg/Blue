@@ -1,5 +1,5 @@
 
-            return "1y"import numpy as np
+return "1y"import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
