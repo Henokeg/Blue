@@ -78,16 +78,17 @@ st.caption(f"{t}: got {len(df)} bars")
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
     return df if not df.empty else None
 
-def generate_signal(
-    df: pd.DataFrame,
-    short_ema_period: int = 50,
-    long_ema_period: int = 200,
-    rsi_period: int = 14,
-    rsi_buy_thresh: int = 40,
-    rsi_sell_thresh: int = 70,
-    atr_mult_for_stop: float = 1.5,
-):
-    close = df["Close"]
+def generate_signal(df, short_ema_period=50, long_ema_period=200,
+                    rsi_period=14, rsi_buy_thresh=40, rsi_sell_thresh=70,
+                    atr_mult_for_stop=1.5):
+
+    # ✅ Make sure this IF is aligned at the first indentation level inside the function
+    if df is None or df.empty:
+        raise ValueError("No or insufficient data for this interval/period.")
+
+    close = df['Close']
+    ...
+
     needed = max(short_ema_period, long_ema_period, rsi_period) + 5
     if len(close) < needed:
         raise ValueError(f"not_enough_bars: have={len(close)} need>={needed}")
