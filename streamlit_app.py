@@ -1,109 +1,101 @@
-# streamlit_app.py
-import pandas as pd
 import numpy as np
-import streamlit as st
+import pandas as pd
 import yfinance as yf
-
-st.set_page_config(page_title="Stock Watcher", page_icon="📈", layout="wide")
-st.title("📈 Stock Watcher — Watchlist signals & levels")
-st.caption("Signals are educational only — not financial advice.")
+import streamlit as st
 
 # ---------- helpers ----------
+def _period_for(interval: str, lookback_days: int) -> str:
+    """Map interval + lookback to a yfinance 'period' that returns enough bars."""
+    if interval in ("1m", "2m", "5m", "15m", "30m", "60m", "90m"):
+        # intraday data is limited to ~30 days on Yahoo
+        return "30d" if lookback_days > 30 else f"{lookback_days}d"
+    if interval in ("1h",):
+        return "730d"  # 2y is usually plenty
+    if interval in ("1d", "5d", "1wk", "1mo"):
+        # use months/years for longer windows
+        if lookback_days <= 31:
+            return "1mo"
+        if lookback_days <= 93:
+            return "3mo"
+        if lookback_days <= 186:
+            return "6mo"
+        if lookback_days <= 365:
+            return "1y"
+        if lookback_days <= 730:
+            return "2y"
+        return "5y"
+    return "1y"
+
+def fetch_stock_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame | None:
+    """Download OHLCV with sensible defaults and return a clean dataframe."""
+    period = _period_for(interval, lookback_days)
+    try:
+        df = yf.download(
+            tickers=ticker.strip().upper(),
+            period=period,
+            interval=interval,
+            progress=False,
+            threads=False,
+            auto_adjust=False,
+        )
+    except Exception:
+        return None
+
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        # Handle multi-index that yfinance returns for multiple tickers
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.xs(ticker.strip().upper(), level=1, axis=1)
+
+        need = {"Open", "High", "Low", "Close"}
+        if not need.issubset(df.columns):
+            return None
+
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        return df
+    return None
+
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    d = close.diff()
-    up = d.clip(lower=0)
-    dn = -d.clip(upper=0)
-    rs = (up.rolling(period).mean()) / (dn.rolling(period).mean())
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    rs = up.rolling(period).mean() / down.rolling(period).mean()
     return 100 - (100 / (1 + rs))
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    hl = df["High"] - df["Low"]
-    hc = (df["High"] - df["Close"].shift()).abs()
-    lc = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev_c = c.shift()
+    tr = pd.concat([
+        (h - l),
+        (h - prev_c).abs(),
+        (l - prev_c).abs()
+    ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def _period_for(interval: str, lookback_days: int) -> str:
-    # Yahoo caps for intraday:
-    # 1m  → max 7d
-    # 5m  → max 60d
-    # 15m → max 60d
-    # 30m → max 60d
-    # 1h  → max ~730d (2 years)
-    caps = {
-        "1m": 7,
-        "5m": 60,
-        "15m": 60,
-        "30m": 60,
-        "1h": 730,
-        "60m": 730,   # if you ever use 60m internally
-    }
-    if interval == "1d":
-        days = max(lookback_days, 2)
-    else:
-        cap = caps.get(interval, 60)
-        days = min(max(lookback_days, 2), cap)
-    return f"{days}d"
+def generate_signal(
+    df: pd.DataFrame,
+    short_ema_period: int = 50,
+    long_ema_period: int = 200,
+    rsi_period: int = 14,
+    rsi_buy_thresh: int = 40,
+    rsi_sell_thresh: int = 70,
+    atr_mult_for_stop: float = 1.5,
+) -> dict:
+    close = df["Close"]
 
-def fetch_stock_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame | None:
-    ticker = ticker.strip().upper()
-    period = _period_for(interval, lookback_days)
-
-    df = yf.download(
-        tickers=ticker,
-        period=period,
-        interval=interval,
-        progress=False,
-        threads=False,
-        auto_adjust=False,
-    )
-    req_period = _period_for(interval, lookback_days)
-st.caption(f"{t}: requesting interval {interval} with period {req_period}")
-df = fetch_stock_df(t, interval, lookback_days)
-# 64
-st.caption(f"{t}: requesting interval {interval}")
-
-# 65
-df = fetch_stock_df(t, interval, lookback_days)
-
-# 66–79 REPLACE WITH THIS:
-if df is None or df.empty:
-    st.warning(f"{t}: No data returned for this ticker")
-else:
-    st.caption(f"{t}: got {len(df)} bars")
-
-    need = {"Open", "High", "Low", "Close"}
-    if not need.issubset(df.columns):
-        st.warning(f"{t}: missing OHLC columns — skipping")
-    else:
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        # ↓↓↓ keep the rest of your per-ticker processing below this line
-        # e.g., s = generate_signal(df, ...)
-        #      ... show table / chart / results ...
-def generate_signal(df, short_ema_period=50, long_ema_period=200,
-                    rsi_period=14, rsi_buy_thresh=40, rsi_sell_thresh=70,
-                    atr_mult_for_stop=1.5):
-
-    # ✅ Make sure this IF is aligned at the first indentation level inside the function
-    if df is None or df.empty:
-        raise ValueError("No or insufficient data for this interval/period.")
-
-    close = df['Close']
-    ...
-
+    # Need at least this many bars to be safe
     needed = max(short_ema_period, long_ema_period, rsi_period) + 5
     if len(close) < needed:
-        raise ValueError(f"not_enough_bars: have={len(close)} need>={needed}")
+        return {"signal": "N/A (not enough data)"}
 
     se = ema(close, short_ema_period)
     le = ema(close, long_ema_period)
     rsi = compute_rsi(close, rsi_period)
     atr_series = atr(df, 14)
 
-    # crossover state
+    # simple EMA crossover state
     ema_state = "neutral"
     if se.iloc[-1] > le.iloc[-1] and se.iloc[-2] <= le.iloc[-2]:
         ema_state = "bullish_crossover"
@@ -112,127 +104,104 @@ def generate_signal(df, short_ema_period=50, long_ema_period=200,
 
     price = float(close.iloc[-1])
     last_rsi = float(rsi.iloc[-1])
-    last_se = float(se.iloc[-1])
-    last_le = float(le.iloc[-1])
-    last_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else np.nan
+    last_atr = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else np.nan
 
-    # signal
+    # signal logic
     if ema_state == "bullish_crossover" and last_rsi <= rsi_buy_thresh:
         signal = "BUY"
     elif ema_state == "bearish_crossover" and last_rsi >= rsi_sell_thresh:
         signal = "SELL"
     else:
-        signal = "HOLD"
+        if last_rsi < 30:
+            signal = "BUY (RSI oversold)"
+        elif last_rsi > 75:
+            signal = "SELL (RSI overbought)"
+        else:
+            signal = "HOLD"
 
     # levels
     if np.isnan(last_atr):
         stop = tp1 = tp2 = np.nan
     else:
-        if signal == "BUY":
+        if signal.startswith("BUY"):
             stop = price - atr_mult_for_stop * last_atr
-            tp1 = price + 2 * atr_mult_for_stop * last_atr
-            tp2 = price + 4 * atr_mult_for_stop * last_atr
-        elif signal == "SELL":
+            tp1 = price + 2 * last_atr
+            tp2 = price + 4 * last_atr
+        elif signal.startswith("SELL"):
             stop = price + atr_mult_for_stop * last_atr
-            tp1 = price - 1.5 * atr_mult_for_stop * last_atr
-            tp2 = price - 3 * atr_mult_for_stop * last_atr
+            tp1 = price - 1.5 * last_atr
+            tp2 = price - 3 * last_atr
         else:
             stop = tp1 = tp2 = np.nan
 
     return {
-        "signal": signal, "price": price,
-        "short_ema": last_se, "long_ema": last_le,
-        "rsi": last_rsi, "atr": last_atr,
-        "stop": stop, "tp1": tp1, "tp2": tp2, "ema_state": ema_state
+        "signal": signal,
+        "price": price,
+        "short_ema": float(se.iloc[-1]),
+        "long_ema": float(le.iloc[-1]),
+        "rsi": last_rsi,
+        "atr": last_atr,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "ema_state": ema_state,
     }
 
-# ---------- UI (form in main page – works better on mobile) ----------
-st.markdown("### Settings")
-with st.form("settings", clear_on_submit=False):
-    tickers_input = st.text_area("Watchlist (comma-separated)", "AAPL, NVDA, TSLA", height=70)
-    interval = st.selectbox("Interval", ["1d", "1h", "30m", "15m", "5m", "1m"], index=0)
-    lookback_days = st.number_input("History (days)", min_value=2, max_value=3650, value=200)
-    short_ema = st.number_input("Short EMA", min_value=5, max_value=200, value=50)
-    long_ema  = st.number_input("Long EMA",  min_value=20, max_value=500, value=200)
-    rsi_period = st.number_input("RSI period", min_value=5, max_value=50, value=14)
-    rsi_buy = st.number_input("RSI buy ≤", min_value=1, max_value=100, value=40)
-    rsi_sell = st.number_input("RSI sell ≥", min_value=1, max_value=100, value=70)
-    atr_mult = st.number_input("ATR multiple (stop)", min_value=0.1, max_value=10.0, value=1.5, step=0.1)
+# ---------- UI ----------
+st.set_page_config(page_title="Stock Watcher", layout="centered")
+st.title("📈 Stock Watcher — Watchlist signals & levels")
+st.caption("Signals are educational only — not financial advice.")
 
-    cols = st.columns(2)
-    run = cols[0].form_submit_button("Run")
-    show_table = cols[1].form_submit_button("Run & show last 10 bars")
+with st.sidebar:
+    st.header("Settings")
+    watchlist = st.text_input("Watchlist (comma-separated)", "AAPL, NVDA, TSLA")
+    interval = st.selectbox("Interval", ["1d", "1wk", "1mo"])
+    history_days = st.slider("History (days)", 60, 365*2, 200, step=10)
 
-# ---------- run ----------
-if run or show_table:
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-    if not tickers:
-        st.error("Please enter at least one ticker.")
-    else:
-        if interval != "1d" and long_ema > 100:
-            st.info("For intraday intervals, consider Long EMA ≤ 100 and History ≤ 60 for reliable data.")
+    short_ema = st.number_input("Short EMA", 5, 1000, 50, step=5)
+    long_ema = st.number_input("Long EMA", 10, 2000, 200, step=10)
+    rsi_period = st.number_input("RSI period", 2, 100, 14, step=1)
+    rsi_buy = st.number_input("RSI buy ≤", 1, 99, 40, step=1)
+    rsi_sell = st.number_input("RSI sell ≥", 1, 99, 70, step=1)
+    atr_mult = st.number_input("ATR multiple (stop)", 0.5, 5.0, 1.5, step=0.1)
 
-        results = []
-        for t in tickers:
-            with st.spinner(f"Fetching {t}…"):
-                df = fetch_stock_df(t, interval, lookback_days)
+    run = st.button("Run")
 
-            if df is None or len(df) < 2:
-                st.warning(f"{t}: No/insufficient data for this interval/period.")
-                continue
+if run:
+    symbols = [s.strip().upper() for s in watchlist.split(",") if s.strip()]
+    results = []
 
-            # ensure enough bars for chosen lookbacks
-            needed = max(short_ema, long_ema, rsi_period) + 5
-            if len(df) < needed:
-                st.warning(f"{t}: Not enough candles ({len(df)}) for EMA/RSI (need ≥ {needed}). "
-                           "Try Interval = 1d, or reduce Long EMA / increase History.")
-                continue
+    for ticker in symbols:
+        st.caption(f"{ticker}: requesting interval {interval}")
+        df = fetch_stock_df(ticker, interval, history_days)
 
-            # add indicators for display table (optional)
-            se = ema(df["Close"], short_ema)
-            le = ema(df["Close"], long_ema)
-            rsi_ser = compute_rsi(df["Close"], rsi_period)
+        if df is None or df.empty:
+            st.warning(f"{ticker}: No/insufficient data for this interval/period.")
+            continue
 
-            try:
-                s = generate_signal(
-                    df,
-                    short_ema_period=short_ema,
-                    long_ema_period=long_ema,
-                    rsi_period=rsi_period,
-                    rsi_buy_thresh=rsi_buy,
-                    rsi_sell_thresh=rsi_sell,
-                    atr_mult_for_stop=atr_mult,
-                )
-            except Exception as e:
-                st.error(f"{t}: {type(e).__name__}: {e}")
-                continue
+        sig = generate_signal(
+            df,
+            short_ema_period=short_ema,
+            long_ema_period=long_ema,
+            rsi_period=rsi_period,
+            rsi_buy_thresh=rsi_buy,
+            rsi_sell_thresh=rsi_sell,
+            atr_mult_for_stop=atr_mult,
+        )
 
-            st.markdown(f"### {t} — **{s['signal']}**")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Last", f"${s['price']:.2f}")
-            c2.metric(f"EMA {short_ema}", f"${s['short_ema']:.2f}")
-            c3.metric(f"EMA {long_ema}", f"${s['long_ema']:.2f}")
-            c4.metric("RSI", f"{s['rsi']:.1f}")
+        # Show last 10 bars quick peek
+        with st.expander(f"{ticker} — details"):
+            st.dataframe(df.tail(10)[["Open", "High", "Low", "Close"]])
 
-            st.write(f"Stops/Targets → Stop: `{s['stop']:.4f}` · TP1: `{s['tp1']:.4f}` · TP2: `{s['tp2']:.4f}`")
+        results.append({"Ticker": ticker, **sig})
 
-            st.line_chart(df["Close"].tail(200))
-
-            if show_table:
-                last = df[["Open", "High", "Low", "Close"]].copy()
-                last["ShortEMA"] = se
-                last["LongEMA"] = le
-                last["RSI"] = rsi_ser
-                st.dataframe(last[["Open","High","Low","Close","ShortEMA","LongEMA","RSI"]].tail(10))
-
-            results.append({"Ticker": t, **s})
-
-        if results:
-            st.markdown("## Watchlist Summary")
-            summary = pd.DataFrame(results)[
-                ["Ticker","signal","price","rsi","short_ema","long_ema","stop","tp1","tp2"]
+    if results:
+        st.subheader("Watchlist Summary")
+        st.dataframe(
+            pd.DataFrame(results)[
+                ["Ticker", "signal", "price", "rsi", "short_ema", "long_ema", "atr", "stop", "tp1", "tp2"]
             ]
-            st.dataframe(summary)
+        )
 
-st.markdown("---")
+st.markdown("———")
 st.caption("Made with Streamlit + Yahoo Finance. Use at your own risk.")
