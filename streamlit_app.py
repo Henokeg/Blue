@@ -144,11 +144,22 @@ with st.sidebar:
     run = st.button("Run")
 
 def fetch_stock_df(ticker, interval, lookback_days):
+    # yfinance returns fewer bars for intraday; clamp period to a sane window
     period = f"{max(lookback_days, 2)}d" if interval == "1d" else f"{max(min(lookback_days, 60), 2)}d"
-    df = yf.download(tickers=ticker, period=period, interval=interval, progress=False, threads=False)
+
+    df = yf.download(tickers=ticker, period=period, interval=interval,
+                     progress=False, threads=False)
+
+    # Basic validity checks
     if df is None or df.empty:
         return None
-    return df.dropna()
+    for col in ("High", "Low", "Close"):
+        if col not in df.columns:
+            return None
+
+    # Drop rows with missing OHLC
+    df = df.dropna(subset=["High", "Low", "Close"])
+    return df if not df.empty else None
 
 if run:
     tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
@@ -197,4 +208,4 @@ if run:
             ])
 
 st.markdown("---")
-st.caption("Signals are educational only — not financial advice.")
+st.caption("Signals are educational only — not fina
