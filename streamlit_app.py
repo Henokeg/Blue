@@ -64,8 +64,8 @@ def fetch_stock_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFra
 st.caption(f"{t}: requesting interval {interval} with period {req_period}")
 df = fetch_stock_df(t, interval, lookback_days)
 if df is None:
-    st.warning(f"{t}: No data returned for {interval}/{req_period}.")
-    continue
+    st.warning(f"{t}: No data returned for this ticker")
+    return None
 st.caption(f"{t}: got {len(df)} bars")
 
 if df is None or df.empty:
