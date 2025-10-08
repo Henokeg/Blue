@@ -26,19 +26,46 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def fetch_stock_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame | None:
-    # Yahoo returns limited bars for intraday; clamp period
+def _period_for(interval: str, lookback_days: int) -> str:
+    # Yahoo caps for intraday:
+    # 1m  → max 7d
+    # 5m  → max 60d
+    # 15m → max 60d
+    # 30m → max 60d
+    # 1h  → max ~730d (2 years)
+    caps = {
+        "1m": 7,
+        "5m": 60,
+        "15m": 60,
+        "30m": 60,
+        "1h": 730,
+        "60m": 730,   # if you ever use 60m internally
+    }
     if interval == "1d":
-        period = f"{max(lookback_days, 2)}d"
+        days = max(lookback_days, 2)
     else:
-        period = f"{max(min(lookback_days, 60), 2)}d"
+        cap = caps.get(interval, 60)
+        days = min(max(lookback_days, 2), cap)
+    return f"{days}d"
 
-    df = yf.download(tickers=ticker, period=period, interval=interval,
-                     progress=False, threads=False, auto_adjust=False)
+def fetch_stock_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame | None:
+    ticker = ticker.strip().upper()
+    period = _period_for(interval, lookback_days)
+
+    df = yf.download(
+        tickers=ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        threads=False,
+        auto_adjust=False,
+    )
+
     if df is None or df.empty:
         return None
-    need_cols = {"Open", "High", "Low", "Close"}
-    if not need_cols.issubset(df.columns):
+
+    need = {"Open", "High", "Low", "Close"}
+    if not need.issubset(df.columns):
         return None
 
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
