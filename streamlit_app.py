@@ -1,38 +1,42 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
-from datetime import date, timedelta
+import requests
+from bs4 import BeautifulSoup
 
-# ---------- Page ----------
-st.set_page_config(page_title="Stock Watcher", layout="wide")
-st.title("📈 Stock Watcher — Watchlist signals & levels")
-st.caption("Signals are educational only — not financial advice.")
+# -------------------
+# Finviz Scraper
+# -------------------
+def fetch_stock_df(ticker: str):
+    """Fetch stock snapshot data from Finviz"""
+    url = f"https://finviz.com/quote.ashx?t={ticker}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+    except Exception as e:
+        return None, f"Error fetching data: {e}"
 
-# ---------- Sidebar / Inputs ----------
-with st.sidebar:
-    st.header("Settings")
-    watchlist_raw = st.text_input(
-        "Watchlist (comma-separated)",
-        value="AAPL, NVDA, TSLA",
-        help="Example: AAPL, MSFT, GOOG"
-    )
-    interval = st.selectbox(
-        "Interval",
-        ["1d", "1h", "30m", "15m", "5m"],
-        index=0
-    )
-    lookback_days = st.number_input("History (days)", 30, 2000, 365, step=5)
-    short_ema = st.number_input("Short EMA", 5, 200, 20)
-    long_ema  = st.number_input("Long EMA", 10, 400, 50)
-    rsi_period = st.number_input("RSI period", 5, 50, 14)
-    rsi_buy  = st.number_input("RSI buy ≤", 10, 60, 40)
-    rsi_sell = st.number_input("RSI sell ≥", 40, 90, 70)
-    atr_mult = st.number_input("ATR multiple (stop)", 0.5, 5.0, 1.5, step=0.1)
+    soup = BeautifulSoup(response.text, "lxml")
 
-    run = st.button("Run")
-    show_last = st.button("Run & show last 10 bars")
+    # Find Finviz table
+    table = soup.find("table", class_="snapshot-table2")
+    if table is None:
+        return None, "No data table found on Finviz page."
 
+    data = {}
+    rows = table.find_all("tr")
+    for row in rows:
+        cells = row.find_all("td")
+        for i in range(0, len(cells), 2):
+            key = cells[i].text.strip()
+            val = cells[i+1].text.strip()
+            data[key] = val
+
+    # Convert to DataFrame
+    df = pd.DataFrame(list(data.items()), columns=["Metric", "Value"])
+    return df, None
 # ---------- Helpers ----------
 @st.cache_data(show_spinner=False)
 def fetch_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame:
