@@ -1,126 +1,163 @@
-import streamlit as st
-import pandas as pd
+import time
+import math
 import numpy as np
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import streamlit as st
 
-# -------------------
-# Finviz Scraper
-# -------------------
-def fetch_stock_df(ticker: str):
-    """Fetch stock snapshot data from Finviz"""
-    url = f"https://finviz.com/quote.ashx?t={ticker}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-    except Exception as e:
-        return None, f"Error fetching data: {e}"
+# History providers
+import yfinance as yf
+from pandas_datareader import data as pdr
 
-    soup = BeautifulSoup(response.text, "lxml")
 
-    # Find Finviz table
-    table = soup.find("table", class_="snapshot-table2")
-    if table is None:
-        return None, "No data table found on Finviz page."
-
-    data = {}
-    rows = table.find_all("tr")
-    for row in rows:
-        cells = row.find_all("td")
-        for i in range(0, len(cells), 2):
-            key = cells[i].text.strip()
-            val = cells[i+1].text.strip()
-            data[key] = val
-
-    # Convert to DataFrame
-    df = pd.DataFrame(list(data.items()), columns=["Metric", "Value"])
-    return df, None
-# ---------- Helpers ----------
-@st.cache_data(show_spinner=False)
-def fetch_df(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame:
-    """Fetch OHLCV for a single ticker. Returns empty df on failure."""
-    period = f"{min(lookback_days, 3640)}d"
-    try:
-        df = yf.download(
-            tickers=ticker,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-        )
-    except Exception:
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.reset_index().rename(columns=str)
-    # Ensure standard column names exist
-    need = {"Open", "High", "Low", "Close"}
-    if not need.issubset(df.columns):
-        return pd.DataFrame()
-
-    # Drop rows with missing price values
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    return df
-
+# -----------------------------
+# Helpers: indicators
+# -----------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    d = close.diff()
-    up = d.clip(lower=0)
-    dn = -d.clip(upper=0)
-    rs = up.rolling(period).mean() / dn.rolling(period).mean()
-    return 100 - (100 / (1 + rs))
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    rs = up.rolling(period).mean() / down.rolling(period).mean()
+    out = 100 - (100 / (1 + rs))
+    return out
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    hl = df["High"] - df["Low"]
-    hc = (df["High"] - df["Close"].shift()).abs()
-    lc = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # expects columns: High, Low, Close
+    h, l, c = df['High'], df['Low'], df['Close']
+    tr = pd.concat([
+        (h - l),
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def analyze(df: pd.DataFrame,
-            short_ema_period: int,
-            long_ema_period: int,
-            rsi_period: int,
-            rsi_buy_thresh: int,
-            rsi_sell_thresh: int,
-            atr_mult_for_stop: float):
-    """Return dict with signal/levels or None if not enough data."""
-    if df is None or df.empty:
-        return None
 
-    # Need enough bars for indicators
-    needed = max(short_ema_period, long_ema_period, rsi_period) + 5
-    if len(df) < needed:
-        return None
+# -----------------------------
+# Finviz snapshot (name/price/ratios)
+# -----------------------------
+def fetch_finviz_snapshot(ticker: str) -> tuple[dict, str | None]:
+    """
+    Scrapes Finviz quote page snapshot table.
+    Returns (data_dict, error_message)
+    """
+    url = f"https://finviz.com/quote.ashx?t={ticker}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finviz.com/"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code != 200:
+            return {}, f"Finviz returned HTTP {resp.status_code}."
+        soup = BeautifulSoup(resp.text, "lxml")
 
+        # Title (e.g., Company name / ticker)
+        title_el = soup.select_one(".fullview-title")
+        title = title_el.get_text(strip=True) if title_el else ticker.upper()
+
+        # Snapshot table
+        snap = {}
+        for row in soup.select("table.snapshot-table2 tr"):
+            cols = [c.get_text(strip=True) for c in row.select("td")]
+            # cells come in pairs: Key | Val | Key | Val | ...
+            for i in range(0, len(cols), 2):
+                if i + 1 < len(cols):
+                    k, v = cols[i], cols[i+1]
+                    if k: snap[k] = v
+        return {"title": title, **snap}, None
+    except Exception as e:
+        return {}, f"Finviz error: {e}"
+
+
+# -----------------------------
+# Price history (Yahoo ➜ Stooq fallback)
+# -----------------------------
+def fetch_history(ticker: str, days: int = 365, interval: str = "1d") -> pd.DataFrame | None:
+    """
+    Try yfinance first; if empty, fall back to Stooq (pandas-datareader).
+    Returns DataFrame with columns [Open, High, Low, Close, Volume]
+    """
+    # --- Yahoo
+    try:
+        df = yf.download(
+            tickers=ticker,
+            period=f"{days}d",
+            interval=interval,
+            auto_adjust=False,
+            actions=False,
+            progress=False,
+            threads=False
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            out = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            out.dropna(how="any", inplace=True)
+            if not out.empty:
+                return out
+    except Exception:
+        pass
+
+    # --- Stooq fallback
+    try:
+        df = pdr.DataReader(ticker, "stooq")
+        df = df.sort_index()
+        if days:
+            df = df.tail(days)
+        out = df.rename(columns=str.title)[["Open", "High", "Low", "Close", "Volume"]].copy()
+        out.dropna(how="any", inplace=True)
+        if not out.empty:
+            return out
+    except Exception:
+        pass
+
+    return None
+
+
+# -----------------------------
+# Signals / levels from history
+# -----------------------------
+def generate_signal(df: pd.DataFrame,
+                    short_ema: int = 50,
+                    long_ema: int = 200,
+                    rsi_period: int = 14,
+                    rsi_buy: float = 40,
+                    rsi_sell: float = 70,
+                    atr_mult: float = 1.5) -> dict:
+    """
+    Compute EMA crossover + RSI filter; derive stop & targets from ATR.
+    """
     close = df["Close"]
-    se = ema(close, short_ema_period)
-    le = ema(close, long_ema_period)
-    rsi = compute_rsi(close, rsi_period)
-    atr = compute_atr(df, 14)
+    need = max(short_ema, long_ema, rsi_period) + 5
+    if len(close) < need:
+        return {"error": f"Not enough bars ({len(close)}) for chosen periods (need ≥ {need})."}
+
+    se = ema(close, short_ema)
+    le = ema(close, long_ema)
+    r = rsi(close, rsi_period)
+    a = atr(df, 14)
+
+    # crossovers
+    state = "neutral"
+    if se.iloc[-1] > le.iloc[-1] and se.iloc[-2] <= le.iloc[-2]:
+        state = "bullish_crossover"
+    elif se.iloc[-1] < le.iloc[-1] and se.iloc[-2] >= le.iloc[-2]:
+        state = "bearish_crossover"
 
     price = float(close.iloc[-1])
-    last_rsi = float(rsi.iloc[-1])
-    last_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else np.nan
+    last_rsi = float(r.iloc[-1])
+    last_atr = float(a.iloc[-1]) if not math.isnan(a.iloc[-1]) else float("nan")
 
-    # EMA cross state
-    ema_state = "neutral"
-    if se.iloc[-1] > le.iloc[-1] and se.iloc[-2] <= le.iloc[-2]:
-        ema_state = "bullish_crossover"
-    elif se.iloc[-1] < le.iloc[-1] and se.iloc[-2] >= le.iloc[-2]:
-        ema_state = "bearish_crossover"
-
-    # Signal logic
-    if ema_state == "bullish_crossover" and last_rsi <= rsi_buy_thresh:
+    if state == "bullish_crossover" and last_rsi <= rsi_buy:
         signal = "BUY"
-    elif ema_state == "bearish_crossover" and last_rsi >= rsi_sell_thresh:
+    elif state == "bearish_crossover" and last_rsi >= rsi_sell:
         signal = "SELL"
     else:
         if last_rsi < 30:
@@ -130,87 +167,127 @@ def analyze(df: pd.DataFrame,
         else:
             signal = "HOLD"
 
-    # Levels from ATR
-    if np.isnan(last_atr):
-        stop = tp1 = tp2 = np.nan
-    else:
+    if not math.isnan(last_atr):
         if signal.startswith("BUY"):
-            stop = price - atr_mult_for_stop * last_atr
-            tp1 = price + 2 * last_atr
-            tp2 = price + 4 * last_atr
+            stop = round(price - atr_mult * last_atr, 2)
+            tp1 = round(price + 2 * last_atr, 2)
+            tp2 = round(price + 4 * last_atr, 2)
         elif signal.startswith("SELL"):
-            stop = price + atr_mult_for_stop * last_atr
-            tp1 = price - 2 * last_atr
-            tp2 = price - 4 * last_atr
+            stop = round(price + atr_mult * last_atr, 2)
+            tp1 = round(price - 1.5 * last_atr, 2)
+            tp2 = round(price - 3 * last_atr, 2)
         else:
-            stop = tp1 = tp2 = np.nan
+            stop = tp1 = tp2 = float("nan")
+    else:
+        stop = tp1 = tp2 = float("nan")
 
     return {
         "signal": signal,
-        "price": price,
-        "short_ema": float(se.iloc[-1]),
-        "long_ema": float(le.iloc[-1]),
-        "rsi": last_rsi,
-        "atr": last_atr,
+        "state": state,
+        "price": round(price, 2),
+        "short_ema": round(float(se.iloc[-1]), 2),
+        "long_ema": round(float(le.iloc[-1]), 2),
+        "rsi": round(last_rsi, 1),
+        "atr": None if math.isnan(last_atr) else round(last_atr, 2),
         "stop": stop,
         "tp1": tp1,
-        "tp2": tp2,
-        "ema_state": ema_state,
+        "tp2": tp2
     }
 
-# ---------- Run ----------
-if run or show_last:
-    tickers = [t.strip().upper() for t in watchlist_raw.split(",") if t.strip()]
-    if not tickers:
-        st.warning("Add at least one ticker in the sidebar.")
-    else:
-        results = []
-        for t in tickers:
-            st.subheader(t)
-            st.caption(f"requesting interval **{interval}** for ~**{lookback_days}** days")
-            df = fetch_df(t, interval, lookback_days)
 
-            if df.empty:
-                st.warning(f"{t}: No/insufficient data for this interval/period.")
-                continue
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Stock Watcher", page_icon="📈", layout="wide")
+st.title("📈 Stock Watcher — Watchlist signals & levels")
+st.caption("Signals are educational only — not financial advice.")
 
-            s = analyze(
-                df,
-                short_ema_period=short_ema,
-                long_ema_period=long_ema,
-                rsi_period=rsi_period,
-                rsi_buy_thresh=rsi_buy,
-                rsi_sell_thresh=rsi_sell,
-                atr_mult_for_stop=atr_mult,
-            )
+with st.sidebar:
+    st.header("Settings")
 
-            if s is None:
-                st.warning(f"{t}: Not enough bars to compute indicators yet.")
-                continue
+    watchlist_str = st.text_input("Watchlist (comma-separated)", "AAPL, NVDA, TSLA")
+    interval = st.selectbox("Interval", ["1d"], index=0)
+    history_days = st.number_input("History (days)", min_value=60, max_value=2000, value=365, step=5)
 
-            st.markdown(
-                f"**Signal:** `{s['signal']}`  •  "
-                f"**Price:** {s['price']:.2f}  •  **RSI:** {s['rsi']:.1f}  •  "
-                f"**EMA(Short/Long):** {s['short_ema']:.2f} / {s['long_ema']:.2f}"
-            )
-            st.markdown(
-                f"**Stop:** {s['stop'] if np.isnan(s['stop']) else f'{s['stop']:.2f}'}  "
-                f"• **TP1:** {s['tp1'] if np.isnan(s['tp1']) else f'{s['tp1']:.2f}'}  "
-                f"• **TP2:** {s['tp2'] if np.isnan(s['tp2']) else f'{s['tp2']:.2f}'}"
-            )
+    short_ema = st.number_input("Short EMA", min_value=5, max_value=200, value=20, step=1)
+    long_ema = st.number_input("Long EMA", min_value=10, max_value=400, value=50, step=5)
+    rsi_period = st.number_input("RSI period", min_value=5, max_value=50, value=14, step=1)
+    rsi_buy = st.number_input("RSI buy ≤", min_value=5, max_value=60, value=40, step=1)
+    rsi_sell = st.number_input("RSI sell ≥", min_value=40, max_value=95, value=70, step=1)
+    atr_mult = st.number_input("ATR multiple (stop)", min_value=0.5, max_value=5.0, value=1.5, step=0.1)
 
-            if show_last:
-                st.dataframe(df.tail(10))
+    run = st.button("Run")
 
-            results.append({"Ticker": t, **s})
+tickers = [t.strip().upper() for t in watchlist_str.split(",") if t.strip()]
+if not tickers:
+    st.info("Add at least one ticker in the sidebar to begin.")
+    st.stop()
 
-        if results:
-            st.markdown("## Watchlist Summary")
-            st.dataframe(
-                pd.DataFrame(results)[
-                    ["Ticker", "signal", "price", "rsi", "short_ema", "long_ema", "stop", "tp1", "tp2"]
-                ]
-            )
+if run:
+    results = []
 
-st.markdown("---")
-st.caption("Made with Streamlit + Yahoo Finance. Use at your own risk.")
+    for t in tickers:
+        st.markdown(f"### {t}")
+        with st.spinner(f"Fetching Finviz snapshot for {t}…"):
+            snap, err = fetch_finviz_snapshot(t)
+        if err:
+            st.warning(f"{t}: {err}")
+
+        if snap:
+            # show a small snapshot subset if available
+            cols = st.columns(3)
+            cols[0].metric("Name", snap.get("title", t))
+            cols[1].metric("P/E", snap.get("P/E", "—"))
+            cols[2].metric("EPS (ttm)", snap.get("EPS (ttm)", "—"))
+
+        st.caption(f"{t}: requesting **{interval}** for ~**{history_days}** days")
+        df = fetch_history(t, days=history_days, interval=interval)
+
+        if df is None or df.empty:
+            st.error(f"{t}: No/insufficient data for this interval/period (Yahoo & Stooq both failed).")
+            st.divider()
+            continue
+
+        sig = generate_signal(
+            df,
+            short_ema=short_ema,
+            long_ema=long_ema,
+            rsi_period=rsi_period,
+            rsi_buy=rsi_buy,
+            rsi_sell=rsi_sell,
+            atr_mult=atr_mult
+        )
+        if "error" in sig:
+            st.error(f"{t}: {sig['error']}")
+            st.divider()
+            continue
+
+        # Last 10 bars table (quick look)
+        last = df.tail(10).copy()
+        last["ShortEMA"] = ema(df["Close"], short_ema).tail(10).round(2)
+        last["LongEMA"] = ema(df["Close"], long_ema).tail(10).round(2)
+        last["RSI"] = rsi(df["Close"], rsi_period).tail(10).round(1)
+        st.dataframe(last[["Open", "High", "Low", "Close", "ShortEMA", "LongEMA", "RSI"]])
+
+        # Summary row
+        row = {
+            "Ticker": t,
+            "Signal": sig["signal"],
+            "State": sig["state"],
+            "Price": sig["price"],
+            "ShortEMA": sig["short_ema"],
+            "LongEMA": sig["long_ema"],
+            "RSI": sig["rsi"],
+            "ATR": sig["atr"],
+            "Stop": sig["stop"],
+            "TP1": sig["tp1"],
+            "TP2": sig["tp2"],
+        }
+        results.append(row)
+        st.divider()
+
+    if results:
+        st.subheader("Watchlist Summary")
+        st.dataframe(pd.DataFrame(results)[
+            ["Ticker","Signal","State","Price","ShortEMA","LongEMA","RSI","ATR","Stop","TP1","TP2"]
+        ])
