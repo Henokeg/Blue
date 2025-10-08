@@ -10,7 +10,7 @@ st.caption("Signals are educational only — not financial advice.")
 
 # ---------- helpers ----------
 def ema(series: pd.Series, span: int) -> pd.Series:
-    return series. by ewm(span=span, adjust=False).mean()
+    return series.ewm(span=span, adjust=False).mean()
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     d = close.diff()
