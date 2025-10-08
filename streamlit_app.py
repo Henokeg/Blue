@@ -68,9 +68,8 @@ if df is None:
     continue
 st.caption(f"{t}: got {len(df)} bars")
 
-    if df is None or df.empty:
-        return None
-
+if df is None or df.empty:
+    return None   # <-- this line indented by exactly 4 spaces
     need = {"Open", "High", "Low", "Close"}
     if not need.issubset(df.columns):
         return None
